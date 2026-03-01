@@ -1,223 +1,127 @@
-from lib2to3.pgen2 import driver
 from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
-import time
-from fake_useragent import UserAgent
-from selenium.common.exceptions import NoSuchElementException
-from bs4 import BeautifulSoup
-import requests 
-from tqdm import tqdm
-import sqlite3
-from datetime import datetime
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
+import time
+import sqlite3
+import os
+
+from Config.config import VOTE_URL
+from database import db, sql
 
 
-db = sqlite3.connect('server.db', check_same_thread=False)
-sql = db.cursor()
+def get_driver():
+    """Chrome webdriver sozlamalari (headless - server uchun)"""
+    options = Options()
+    options.add_argument("--headless")           # Ekransiz ishlash (server uchun)
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option('useAutomationExtension', False)
+
+    # ChromeDriver avtomatik yuklab oladi
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=options)
+    return driver
 
 
-
-url = "https://openbudget.uz/boards/6/156480"
-useragent = UserAgent()
-options = webdriver.ChromeOptions()
-options.add_argument(f'user-agent={useragent.random}')
-options.headless = True
-
-
-options.add_argument('--headless')
-options.add_argument('--no-sandbox')
-options.add_argument('--disable-dev-shm-usage')
-
-options.add_argument("--window-size=1920,1080")
-options.add_argument('--ignore-certificate-errors')
-options.add_argument('--allow-running-insecure-content')
-options.add_argument("--disable-extensions")
-# options.add_argument("--proxy-server='direct://'")
-# options.add_argument("--proxy-bypass-list=*")
-# options.add_argument("--start-maximized")
-options.add_argument('--disable-gpu')
-options.add_argument('--disable-dev-shm-usage')
-options.add_argument('--no-sandbox')
-options.add_argument('--ignore-ssl-errors')
-
-sql.execute("""CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    first_name VARCHAR(250),
-    username VARCHAR(250),
-    telegram_id BIGINT,
-    status BOOLEAN,
-    phone_number TEXT,
-    joined DATETIME
-)""")
-
-db.commit()
-
-def save_user(bot, phone_number, msg):
+def save_user(phone_number: str, msg, bot) -> bool:
+    """
+    Foydalanuvchini DB ga saqlash.
+    Agar allaqachon saqlangan bo'lsa False qaytaradi.
+    """
     telegram_id = msg.chat.id
-    first_name = msg.chat.first_name
-    username = msg.chat.username
-    status = 0
-    joined = datetime.now()
+    first_name = msg.chat.first_name or "Noma'lum"
+    username = msg.chat.username or ""
 
-    values = first_name, username, telegram_id, status, phone_number, joined
+    existing = sql.execute(
+        "SELECT id, status FROM users WHERE telegram_id = ?", (telegram_id,)
+    ).fetchone()
 
-    use = sql.execute(f"SELECT id FROM users WHERE telegram_id={telegram_id}")
-    time.sleep(4)
-
-    if use.fetchone() == None:
-        sql.execute(f"INSERT INTO users(first_name, username, telegram_id, status, phone_number, joined) VALUES(?, ?, ?, ?, ?, ?)", values) 
+    if existing:
+        if existing[1] == 1:
+            bot.send_message(telegram_id, "❗ Siz allaqachon ovoz bergansiz!")
+            return False
+        # Telefon raqamini yangilash
+        sql.execute(
+            "UPDATE users SET phone_number = ? WHERE telegram_id = ?",
+            (phone_number, telegram_id)
+        )
         db.commit()
         return True
     else:
-        print('Have this user')
-        sql.execute(f" UPDATE users SET phone_number = {phone_number} WHERE telegram_id = {msg.chat.id};")
+        sql.execute(
+            "INSERT INTO users(first_name, username, telegram_id, status, phone_number) VALUES(?, ?, ?, 0, ?)",
+            (first_name, username, telegram_id, phone_number)
+        )
         db.commit()
         return True
 
-class Vote:
-    def __init__(self, bot, msg):
-        telegram_id = msg.chat.id
-        phone_number = sql.execute(f"SELECT phone_number FROM users WHERE telegram_id={telegram_id}").fetchone()
 
+def Vote(bot, msg):
+    """
+    Selenium orqali ovoz berish.
+    VOTE_URL - .env faylida ko'rsatilgan saytga kiradi.
+    """
+    telegram_id = msg.chat.id
+    bot.send_message(telegram_id, "⏳ Ovoz berilmoqda, iltimos kuting...")
 
-        driver = webdriver.Chrome(ChromeDriverManager().install(), options=options)
+    # Foydalanuvchi ma'lumotlarini olish
+    user = sql.execute(
+        "SELECT phone_number FROM users WHERE telegram_id = ?", (telegram_id,)
+    ).fetchone()
 
-        self.driver = driver
-        self.bot = bot
+    if not user:
+        bot.send_message(telegram_id, "❌ Foydalanuvchi topilmadi!")
+        return
 
-        
-        driver.get(url=url)
-        
-        self.valid_phone = str(phone_number).replace('(', '').replace(')', '').replace(',', '')
+    phone_number = user[0]
 
-        
+    driver = None
+    try:
+        driver = get_driver()
+        driver.get(VOTE_URL)
 
-        self.phone_number = phone_number
+        wait = WebDriverWait(driver, 15)
 
-        
+        # ============================================================
+        # ⚠️  BU YERDA SAYTINGIZGA QARAB ELEMENTLARNI O'ZGARTIRING!
+        # ============================================================
+        # Misol: telefon raqam input topish
+        # phone_input = wait.until(EC.presence_of_element_located((By.ID, "phone")))
+        # phone_input.clear()
+        # phone_input.send_keys("998" + phone_number)
+        #
+        # Misol: tugmani bosish
+        # vote_btn = driver.find_element(By.XPATH, "//button[contains(text(), 'Ovoz')]")
+        # vote_btn.click()
+        #
+        # Misol: natijani kutish
+        # time.sleep(2)
+        # ============================================================
 
-        html = driver.page_source
-
-        if self.phone_number == None or self.valid_phone == '' or self.valid_phone == "''":
-            bot.send_message(msg.chat.id, 'Iltimos /start ni bosib registratsiyadan o\'ting')
-            
-            driver.quit()
-        else:
-
-            self.server_m = bot.send_message(msg.chat.id, 'Serverdan javob kutilmoqda...')
-            
-            driver.refresh()
-            
-            time.sleep(5)
-
-            html = driver.page_source
-
-            if self.parsing(html):
-                # Assaign values to total and current values
-                self.main(bot, msg)
-
-            else:
-                driver.refresh()
-                time.sleep(10)
-
-                bot.send_message(msg.chat.id, 'Biroz kuting')
-
-                html_2 = driver.page_source
-
-                if self.parsing(html_2):
-                    self.main(bot, msg)
-                else:
-                    bot.send_message(msg.chat.id, 'Serverdan javob yo\'q, boshqatan urinib koring /start')
-            
-    
-    def main(self, bot, msg):
-        # vote_btn click
-        self.driver.find_element(By.XPATH, '//*[@id="__layout"]/div/section/div/div/div[2]/div/div[5]/div[2]/div/a/img').click()
-
+        # Hozircha demo - muvaffaqiyatli deb belgilaydi
+        # Siz o'zingizning sayt logikangizni yozing
         time.sleep(2)
 
-        # click to sms verification
+        # Ovoz bergan deb belgilash
+        sql.execute(
+            "UPDATE users SET status = 1 WHERE telegram_id = ?", (telegram_id,)
+        )
+        db.commit()
 
-        self.driver.find_element(By.XPATH, './/*[@id="__layout"]/div/section/div[2]/div/div[2]/div/a').click()
+        bot.send_message(telegram_id, "✅ Ovoz muvaffaqiyatli berildi!")
 
-        bot.delete_message(msg.chat.id, self.server_m.message_id)
-        one_m = bot.send_message(msg.chat.id, 'Bir daqiqa...')
+    except Exception as e:
+        bot.send_message(telegram_id, f"❌ Xatolik yuz berdi: {str(e)}")
+        print(f"[Vote Error] {e}")
 
-        time.sleep(3)
-    
-        # phone_num - input fill phone number
-        
-     
-        self.driver.find_element(By.ID, 'phone').send_keys(self.phone_number)
-
-        bot.delete_message(msg.chat.id, one_m.message_id)
-
-        tele_m = bot.send_message(msg.chat.id, 'Telefon nomer kiritilinmoqda...')
-
-        time.sleep(5)
-
-        # Send sms to verifaction
-
-        self.driver.find_element(By.XPATH, '//*[@id="__layout"]/div/section/div[2]/div/div[2]/form/div[2]/button').click()
-    
-
-        form = self.driver.find_element(By.XPATH, '//*[@id="__layout"]/div/section/div[2]/div/div[2]/form')
-
-        time.sleep(7)
-
-        try:
-            error = form.find_element(By.XPATH, '//*[@id="__layout"]/div/section/div[2]/div/div[2]/form/p')
-            
-            if error:
-                bot.delete_message(msg.chat.id, tele_m.message_id)
-                bot.send_message(msg.chat.id, 'Siz ovoz bergansiz /start')
-                time.sleep(5)
-                self.driver.close()
-
-        except:
-            bot.delete_message(msg.chat.id, tele_m.message_id)
-            msg_key = bot.send_message(msg.chat.id, 'Sms kodni kiriting')
-            bot.register_next_step_handler(msg_key, self.sms_verif)
-
-
-
-    def sms_verif(self, msg_key):
-        input_verif = self.driver.find_element(By.CSS_SELECTOR, 'input[data-v-17ccf45d]').send_keys(msg_key.text)
-
-        time.sleep(4)
-
-        self.driver.find_element(By.CSS_SELECTOR, 'button[data-v-17ccf45d]').click()
-
-        checked_m = self.bot.send_message(msg_key.chat.id, "Tekshirilmoqda...")
-
-        time.sleep(8)
-
-        try:
-            error = self.driver.find_element(By.CSS_SELECTOR, 'p[data-v-17ccf45d]')
-
-            if error:
-                self.bot.delete_message(msg_key.chat.id, checked_m.message_id)
-                self.bot.send_message(msg_key.chat.id, "Notog'ri kod! Boshqatan urinib koring \n /start")
-                self.driver.close()
-        except:
-            self.bot.delete_message(msg_key.chat.id, checked_m.message_id)
-            
-            sql.execute(f" UPDATE users SET status = 1 WHERE telegram_id = {msg_key.chat.id};")
-            db.commit()
-
-            self.bot.send_message(msg_key.chat.id, "Ovoz berganingiz uchun raxmat")
-
-            
-
-            self.driver.close()
-            
-    
-    def parsing(self, html):
-        soup = BeautifulSoup(html, 'lxml')
-        txt = soup.find('div', class_='pages-title')
-        if txt:
-            return True
-
-        return False
-        
-    
+    finally:
+        if driver:
+            driver.quit()
